@@ -21,6 +21,7 @@ tasks.withType(JavaCompile) {
 
 dependencies {
     implementation "androidx.annotation:annotation:1.0.1"
+    implementation "org.chromium.net:cronet-embedded:66.3359.158"
 }
 
 // Check if the android plugin version supports unit testing.

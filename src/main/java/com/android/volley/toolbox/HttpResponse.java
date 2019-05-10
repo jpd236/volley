@@ -15,7 +15,13 @@
  */
 package com.android.volley.toolbox;
 
+import android.support.annotation.Nullable;
+
 import com.android.volley.Header;
+import com.android.volley.VolleyLog;
+
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
 import java.io.InputStream;
 import java.util.Collections;
 import java.util.List;
@@ -27,6 +33,7 @@ public final class HttpResponse {
     private final List<Header> mHeaders;
     private final int mContentLength;
     private final InputStream mContent;
+    private final byte[] mContentBytes;
 
     /**
      * Construct a new HttpResponse for an empty response body.
@@ -53,6 +60,16 @@ public final class HttpResponse {
         mHeaders = headers;
         mContentLength = contentLength;
         mContent = content;
+        mContentBytes = null;
+    }
+
+    public HttpResponse(
+            int statusCode, List<Header> headers, byte[] contentBytes) {
+        mStatusCode = statusCode;
+        mHeaders = headers;
+        mContentLength = contentBytes.length;
+        mContent = null;
+        mContentBytes = contentBytes;
     }
 
     /** Returns the HTTP status code of the response. */
@@ -74,7 +91,50 @@ public final class HttpResponse {
      * Returns an {@link InputStream} of the response content. May be null to indicate that the
      * response has no content.
      */
+    @Nullable
     public final InputStream getContent() {
+        if (mContent == null && mContentBytes != null) {
+            return new ByteArrayInputStream(mContentBytes);
+        }
         return mContent;
+    }
+
+    @Nullable
+    final byte[] getContentBytes(ByteArrayPool pool) throws IOException {
+        if (mContentBytes != null) {
+            return mContentBytes;
+        }
+        if (mContent == null) {
+            return null;
+        }
+        return inputStreamToBytes(pool, mContent, mContentLength);
+    }
+
+    /** Reads the contents of an InputStream into a byte[]. */
+    private static byte[] inputStreamToBytes(ByteArrayPool pool, InputStream in, int contentLength)
+            throws IOException {
+        PoolingByteArrayOutputStream bytes = new PoolingByteArrayOutputStream(pool, contentLength);
+        byte[] buffer = null;
+        try {
+            buffer = pool.getBuf(1024);
+            int count;
+            while ((count = in.read(buffer)) != -1) {
+                bytes.write(buffer, 0, count);
+            }
+            return bytes.toByteArray();
+        } finally {
+            try {
+                // Close the InputStream and release the resources by "consuming the content".
+                if (in != null) {
+                    in.close();
+                }
+            } catch (IOException e) {
+                // This can happen if there was an exception above that left the stream in
+                // an invalid state.
+                VolleyLog.v("Error occurred when closing InputStream");
+            }
+            pool.returnBuf(buffer);
+            bytes.close();
+        }
     }
 }

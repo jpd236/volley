@@ -205,6 +205,10 @@ public class RequestQueue {
         return mCache;
     }
 
+    ResponseDelivery getResponseDelivery() {
+        return mDelivery;
+    }
+
     /**
      * A simple predicate or filter interface for Requests, for use by {@link
      * RequestQueue#cancelAll(RequestFilter)}.
@@ -263,13 +267,21 @@ public class RequestQueue {
         request.addMarker("add-to-queue");
         sendRequestEvent(request, RequestEvent.REQUEST_QUEUED);
 
+        beginRequest(request);
+        return request;
+    }
+
+    <T> void beginRequest(Request<T> request) {
         // If the request is uncacheable, skip the cache queue and go straight to the network.
         if (!request.shouldCache()) {
-            mNetworkQueue.add(request);
-            return request;
+            sendRequestOverNetwork(request);
+        } else {
+            mCacheQueue.add(request);
         }
-        mCacheQueue.add(request);
-        return request;
+    }
+
+    <T> void sendRequestOverNetwork(Request<T> request) {
+        mNetworkQueue.add(request);
     }
 
     /**

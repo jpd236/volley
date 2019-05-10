@@ -17,12 +17,14 @@
 package com.android.volley.toolbox;
 
 import android.os.SystemClock;
+import android.support.annotation.Nullable;
+
+import com.android.volley.AsyncNetwork;
 import com.android.volley.AuthFailureError;
 import com.android.volley.Cache;
 import com.android.volley.Cache.Entry;
 import com.android.volley.ClientError;
 import com.android.volley.Header;
-import com.android.volley.Network;
 import com.android.volley.NetworkError;
 import com.android.volley.NetworkResponse;
 import com.android.volley.NoConnectionError;
@@ -32,8 +34,8 @@ import com.android.volley.ServerError;
 import com.android.volley.TimeoutError;
 import com.android.volley.VolleyError;
 import com.android.volley.VolleyLog;
+
 import java.io.IOException;
-import java.io.InputStream;
 import java.net.HttpURLConnection;
 import java.net.MalformedURLException;
 import java.net.SocketTimeoutException;
@@ -47,7 +49,7 @@ import java.util.TreeMap;
 import java.util.TreeSet;
 
 /** A network performing Volley requests over an {@link HttpStack}. */
-public class BasicNetwork implements Network {
+public class BasicNetwork extends AsyncNetwork {
     protected static final boolean DEBUG = VolleyLog.DEBUG;
 
     private static final int SLOW_REQUEST_THRESHOLD_MS = 3000;
@@ -109,108 +111,147 @@ public class BasicNetwork implements Network {
         mPool = pool;
     }
 
-    @Override
-    public NetworkResponse performRequest(Request<?> request) throws VolleyError {
-        long requestStart = SystemClock.elapsedRealtime();
-        while (true) {
-            HttpResponse httpResponse = null;
-            byte[] responseContents = null;
-            List<Header> responseHeaders = Collections.emptyList();
-            try {
-                // Gather headers.
-                Map<String, String> additionalRequestHeaders =
-                        getCacheHeaders(request.getCacheEntry());
-                httpResponse = mBaseHttpStack.executeRequest(request, additionalRequestHeaders);
-                int statusCode = httpResponse.getStatusCode();
+    private void onRequestSucceeded(Request<?> request, long requestStartMs, HttpResponse httpResponse,
+                OnRequestComplete callback) {
+        int statusCode = httpResponse.getStatusCode();
+        List<Header> responseHeaders = httpResponse.getHeaders();
+        // Handle cache validation.
+        if (statusCode == HttpURLConnection.HTTP_NOT_MODIFIED) {
+            Entry entry = request.getCacheEntry();
+            if (entry == null) {
+                callback.onSuccess(new NetworkResponse(
+                        HttpURLConnection.HTTP_NOT_MODIFIED,
+                        /* data= */ null,
+                        /* notModified= */ true,
+                        SystemClock.elapsedRealtime() - requestStartMs,
+                        responseHeaders));
+                return;
+            }
+            // Combine cached and response headers so the response will be complete.
+            List<Header> combinedHeaders = combineHeaders(responseHeaders, entry);
+            callback.onSuccess(new NetworkResponse(
+                    HttpURLConnection.HTTP_NOT_MODIFIED,
+                    entry.data,
+                    /* notModified= */ true,
+                    SystemClock.elapsedRealtime() - requestStartMs,
+                    combinedHeaders));
+        }
 
-                responseHeaders = httpResponse.getHeaders();
-                // Handle cache validation.
-                if (statusCode == HttpURLConnection.HTTP_NOT_MODIFIED) {
-                    Entry entry = request.getCacheEntry();
-                    if (entry == null) {
-                        return new NetworkResponse(
-                                HttpURLConnection.HTTP_NOT_MODIFIED,
-                                /* data= */ null,
-                                /* notModified= */ true,
-                                SystemClock.elapsedRealtime() - requestStart,
-                                responseHeaders);
-                    }
-                    // Combine cached and response headers so the response will be complete.
-                    List<Header> combinedHeaders = combineHeaders(responseHeaders, entry);
-                    return new NetworkResponse(
-                            HttpURLConnection.HTTP_NOT_MODIFIED,
-                            entry.data,
-                            /* notModified= */ true,
-                            SystemClock.elapsedRealtime() - requestStart,
-                            combinedHeaders);
-                }
+        // Some responses such as 204s do not have content.  We must check.
+        // TODO: If the response needs to be read from the InputStream, submit it to the
+        // blocking thread pool.
+        byte[] responseContents;
+        try {
+            responseContents = httpResponse.getContentBytes(mPool);
+        } catch (IOException e) {
+            onRequestFailed(request, callback, e, requestStartMs, httpResponse, null);
+            return;
+        }
+        if (responseContents == null) {
+            // Add 0 byte response as a way of honestly representing a
+            // no-content request.
+            responseContents = new byte[0];
+        }
 
-                // Some responses such as 204s do not have content.  We must check.
-                InputStream inputStream = httpResponse.getContent();
-                if (inputStream != null) {
-                    responseContents =
-                            inputStreamToBytes(inputStream, httpResponse.getContentLength());
-                } else {
-                    // Add 0 byte response as a way of honestly representing a
-                    // no-content request.
-                    responseContents = new byte[0];
-                }
+        // if the request is slow, log it.
+        long requestLifetime = SystemClock.elapsedRealtime() - requestStartMs;
+        logSlowRequests(requestLifetime, request, responseContents, statusCode);
 
-                // if the request is slow, log it.
-                long requestLifetime = SystemClock.elapsedRealtime() - requestStart;
-                logSlowRequests(requestLifetime, request, responseContents, statusCode);
+        if (statusCode < 200 || statusCode > 299) {
+            onRequestFailed(request, callback, new IOException(), requestStartMs, httpResponse, responseContents);
+        }
+        callback.onSuccess(new NetworkResponse(
+                statusCode,
+                responseContents,
+                /* notModified= */ false,
+                SystemClock.elapsedRealtime() - requestStartMs,
+                responseHeaders));
+    }
 
-                if (statusCode < 200 || statusCode > 299) {
-                    throw new IOException();
-                }
-                return new NetworkResponse(
-                        statusCode,
-                        responseContents,
-                        /* notModified= */ false,
-                        SystemClock.elapsedRealtime() - requestStart,
-                        responseHeaders);
-            } catch (SocketTimeoutException e) {
-                attemptRetryOnException("socket", request, new TimeoutError());
-            } catch (MalformedURLException e) {
-                throw new RuntimeException("Bad URL " + request.getUrl(), e);
-            } catch (IOException e) {
-                int statusCode;
+    private void onRequestFailed(Request<?> request, OnRequestComplete callback, IOException exception, long requestStartMs, @Nullable HttpResponse httpResponse, @Nullable byte[] responseContents) {
+        if (exception instanceof SocketTimeoutException) {
+            attemptRetryOnException("socket", request, callback, new TimeoutError());
+        } else if (exception instanceof MalformedURLException) {
+            // TODO: Make sure this propagates correctly.
+            throw new RuntimeException("Bad URL " + request.getUrl(), exception);
+        } else {
+            int statusCode;
+            if (httpResponse != null) {
+                statusCode = httpResponse.getStatusCode();
+            } else {
+                callback.onError(new NoConnectionError(exception));
+                return;
+            }
+            VolleyLog.e("Unexpected response code %d for %s", statusCode, request.getUrl());
+            NetworkResponse networkResponse;
+            if (responseContents != null) {
+                List<Header> responseHeaders;
                 if (httpResponse != null) {
-                    statusCode = httpResponse.getStatusCode();
+                    responseHeaders = httpResponse.getHeaders();
                 } else {
-                    throw new NoConnectionError(e);
+                    responseHeaders = new ArrayList<>();
                 }
-                VolleyLog.e("Unexpected response code %d for %s", statusCode, request.getUrl());
-                NetworkResponse networkResponse;
-                if (responseContents != null) {
-                    networkResponse =
-                            new NetworkResponse(
-                                    statusCode,
-                                    responseContents,
-                                    /* notModified= */ false,
-                                    SystemClock.elapsedRealtime() - requestStart,
-                                    responseHeaders);
-                    if (statusCode == HttpURLConnection.HTTP_UNAUTHORIZED
-                            || statusCode == HttpURLConnection.HTTP_FORBIDDEN) {
+                networkResponse =
+                        new NetworkResponse(
+                                statusCode,
+                                responseContents,
+                                /* notModified= */ false,
+                                SystemClock.elapsedRealtime() - requestStartMs,
+                                responseHeaders);
+                if (statusCode == HttpURLConnection.HTTP_UNAUTHORIZED
+                        || statusCode == HttpURLConnection.HTTP_FORBIDDEN) {
+                    attemptRetryOnException(
+                            "auth", request, callback, new AuthFailureError(networkResponse));
+                } else if (statusCode >= 400 && statusCode <= 499) {
+                    // Don't retry other client errors.
+                    callback.onError(new ClientError(networkResponse));
+                } else if (statusCode >= 500 && statusCode <= 599) {
+                    if (request.shouldRetryServerErrors()) {
                         attemptRetryOnException(
-                                "auth", request, new AuthFailureError(networkResponse));
-                    } else if (statusCode >= 400 && statusCode <= 499) {
-                        // Don't retry other client errors.
-                        throw new ClientError(networkResponse);
-                    } else if (statusCode >= 500 && statusCode <= 599) {
-                        if (request.shouldRetryServerErrors()) {
-                            attemptRetryOnException(
-                                    "server", request, new ServerError(networkResponse));
-                        } else {
-                            throw new ServerError(networkResponse);
-                        }
+                                "server", request, callback, new ServerError(networkResponse));
                     } else {
-                        // 3xx? No reason to retry.
-                        throw new ServerError(networkResponse);
+                        callback.onError(new ServerError(networkResponse));
                     }
                 } else {
-                    attemptRetryOnException("network", request, new NetworkError());
+                    // 3xx? No reason to retry.
+                    callback.onError(new ServerError(networkResponse));
                 }
+            } else {
+                attemptRetryOnException("network", request, callback, new NetworkError());
+            }
+        }
+    }
+
+    @Override
+    public void performRequest(final Request<?> request, final OnRequestComplete callback) {
+        final long requestStartMs = SystemClock.elapsedRealtime();
+        // Gather headers.
+        Map<String, String> additionalRequestHeaders = getCacheHeaders(request.getCacheEntry());
+        if (mBaseHttpStack instanceof AsyncHttpStack) {
+            AsyncHttpStack asyncStack = (AsyncHttpStack) mBaseHttpStack;
+            asyncStack.executeRequest(request, additionalRequestHeaders, new AsyncHttpStack.OnRequestComplete() {
+                @Override
+                public void onSuccess(HttpResponse httpResponse) {
+                    onRequestSucceeded(request, requestStartMs, httpResponse, callback);
+                }
+
+                @Override
+                public void onAuthError(AuthFailureError authFailureError) {
+                    callback.onError(authFailureError);
+                }
+
+                @Override
+                public void onError(IOException ioException) {
+                    onRequestFailed(request, callback, ioException, requestStartMs, null, null);
+                }
+            });
+        } else {
+            try {
+                onRequestSucceeded(request, requestStartMs, mBaseHttpStack.executeRequest(request, additionalRequestHeaders), callback);
+            } catch (AuthFailureError e) {
+                callback.onError(e);
+            } catch (IOException e) {
+                onRequestFailed(request, callback, e, requestStartMs, null, null);
             }
         }
     }
@@ -236,19 +277,25 @@ public class BasicNetwork implements Network {
      *
      * @param request The request to use.
      */
-    private static void attemptRetryOnException(
-            String logPrefix, Request<?> request, VolleyError exception) throws VolleyError {
+    private void attemptRetryOnException(
+            String logPrefix, Request<?> request, OnRequestComplete callback, VolleyError exception) {
         RetryPolicy retryPolicy = request.getRetryPolicy();
         int oldTimeout = request.getTimeoutMs();
 
         try {
+            // TODO: In the future, we should support retrying after some delay if mBaseHttpStack is
+            // an AsyncHttpStack. We can schedule a main-thread runnable after some timeout to call
+            // performRequest. (This isn't safe to do if we don't have an AsyncHttpStack, as in this
+            // case we'd block the main thread on network activity).
             retryPolicy.retry(exception);
         } catch (VolleyError e) {
             request.addMarker(
                     String.format("%s-timeout-giveup [timeout=%s]", logPrefix, oldTimeout));
-            throw e;
+            callback.onError(e);
+            return;
         }
         request.addMarker(String.format("%s-retry [timeout=%s]", logPrefix, oldTimeout));
+        performRequest(request, callback);
     }
 
     private Map<String, String> getCacheHeaders(Cache.Entry entry) {
@@ -274,37 +321,6 @@ public class BasicNetwork implements Network {
     protected void logError(String what, String url, long start) {
         long now = SystemClock.elapsedRealtime();
         VolleyLog.v("HTTP ERROR(%s) %d ms to fetch %s", what, (now - start), url);
-    }
-
-    /** Reads the contents of an InputStream into a byte[]. */
-    private byte[] inputStreamToBytes(InputStream in, int contentLength)
-            throws IOException, ServerError {
-        PoolingByteArrayOutputStream bytes = new PoolingByteArrayOutputStream(mPool, contentLength);
-        byte[] buffer = null;
-        try {
-            if (in == null) {
-                throw new ServerError();
-            }
-            buffer = mPool.getBuf(1024);
-            int count;
-            while ((count = in.read(buffer)) != -1) {
-                bytes.write(buffer, 0, count);
-            }
-            return bytes.toByteArray();
-        } finally {
-            try {
-                // Close the InputStream and release the resources by "consuming the content".
-                if (in != null) {
-                    in.close();
-                }
-            } catch (IOException e) {
-                // This can happen if there was an exception above that left the stream in
-                // an invalid state.
-                VolleyLog.v("Error occurred when closing InputStream");
-            }
-            mPool.returnBuf(buffer);
-            bytes.close();
-        }
     }
 
     /**
