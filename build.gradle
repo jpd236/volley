@@ -60,11 +60,6 @@ version = '1.2.0-SNAPSHOT'
 android {
     compileSdkVersion 28
     buildToolsVersion = '28.0.3'
-
-    defaultConfig {
-        // Keep in sync with src/main/AndroidManifest.xml
-        minSdkVersion 8
-    }
 }
 
 tasks.withType(JavaCompile) {

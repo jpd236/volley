@@ -3,12 +3,10 @@ package com.android.volley;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
-import android.support.annotation.NonNull;
-
+import androidx.annotation.NonNull;
 import com.android.volley.AsyncCache.OnGetCompleteCallback;
 import com.android.volley.AsyncNetwork.OnRequestComplete;
 import com.android.volley.Cache.Entry;
-
 import java.util.Comparator;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
